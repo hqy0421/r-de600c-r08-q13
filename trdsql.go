@@ -6,6 +6,8 @@ package trdsql
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 )
@@ -164,6 +166,11 @@ func (trd *TRDSQL) Exec(sql string) error {
 }
 
 // ExecContext executes SQL processing with context.
+// When ctx is canceled, the open transaction is rolled back
+// and the context error (context.Canceled or
+// context.DeadlineExceeded) is returned wrapped, so callers
+// can distinguish a canceled execution from a completed one
+// with errors.Is.
 func (trd *TRDSQL) ExecContext(ctx context.Context, sqlQuery string) error {
 	db, err := Connect(trd.Driver, trd.Dsn)
 	if err != nil {
@@ -181,6 +188,19 @@ func (trd *TRDSQL) ExecContext(ctx context.Context, sqlQuery string) error {
 		return fmt.Errorf("begin: %w", err)
 	}
 
+	committed := false
+	defer func() {
+		if !committed {
+			// Canceled or failed: roll back so the transaction
+			// is finalized deterministically instead of relying
+			// on connection teardown.
+			if rollbackErr := db.Tx.Rollback(); rollbackErr != nil &&
+				!errors.Is(rollbackErr, sql.ErrTxDone) {
+				log.Printf("rollback: %s", rollbackErr)
+			}
+		}
+	}()
+
 	if trd.Importer != nil {
 		sqlQuery, err = trd.Importer.ImportContext(ctx, db, sqlQuery)
 		if err != nil {
@@ -197,6 +217,7 @@ func (trd *TRDSQL) ExecContext(ctx context.Context, sqlQuery string) error {
 	if err := db.Tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
+	committed = true
 
 	return nil
 }

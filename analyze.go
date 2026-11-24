@@ -1,6 +1,7 @@
 package trdsql
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -47,7 +48,7 @@ func NewAnalyzeOpts() *AnalyzeOpts {
 func Analyze(fileName string, opts *AnalyzeOpts, readOpts *ReadOpts) error {
 	w := opts.OutStream
 	rOpts, fileName := GuessOpts(readOpts, fileName)
-	file, err := importFileOpen(fileName)
+	file, err := importFileOpen(context.Background(), fileName)
 	if err != nil {
 		return err
 	}

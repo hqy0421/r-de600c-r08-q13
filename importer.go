@@ -234,7 +234,7 @@ func ImportFile(db *DB, fileName string, readOpts *ReadOpts) (string, error) {
 func ImportFileContext(ctx context.Context, db *DB, fileName string, readOpts *ReadOpts) (string, error) {
 	opts, fileName := GuessOpts(readOpts, fileName)
 	db.importCount++
-	file, err := importFileOpen(fileName)
+	file, err := importFileOpen(ctx, fileName)
 	if err != nil {
 		debug.Printf("%s\n", err)
 		return "", nil
@@ -326,25 +326,59 @@ func guessFormat(fileName string) Format {
 }
 
 // importFileOpen opens the file specified as a table.
-func importFileOpen(tableName string) (io.ReadCloser, error) {
+func importFileOpen(ctx context.Context, tableName string) (io.ReadCloser, error) {
 	r := regexp.MustCompile(`\*|\?|\[`)
 	if r.MatchString(tableName) {
-		return globFileOpen(tableName)
+		return globFileOpen(ctx, tableName)
 	}
 	return singleFileOpen(tableName)
 }
 
+// nopReadCloser wraps an io.Reader so an unclosable source
+// (such as os.Stdin) can take part in the closer chain as a no-op.
+type nopReadCloser struct {
+	io.Reader
+}
+
+func (nopReadCloser) Close() error { return nil }
+
+// joinedReadCloser closes every reader in the chain.
+// It allows the decompressor and the underlying file
+// to both be closed when the import finishes or is canceled.
+type joinedReadCloser struct {
+	io.Reader
+	closers []io.Closer
+}
+
+// Close closes all wrapped closers and joins any errors.
+func (j *joinedReadCloser) Close() error {
+	var err error
+	for _, c := range j.closers {
+		err = errors.Join(err, c.Close())
+	}
+	return err
+}
+
 // uncompressedReader returns the decompressed reader
 // if it is a compressed file.
-func uncompressedReader(reader io.Reader) io.ReadCloser {
+// The returned io.ReadCloser closes both the decompressor
+// and the underlying source reader when it is closed,
+// so a canceled import does not leak the open file.
+func uncompressedReader(reader io.ReadCloser) io.ReadCloser {
 	var err error
 	buf := [7]byte{}
 	n, err := io.ReadAtLeast(reader, buf[:], len(buf))
 	if err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return io.NopCloser(bytes.NewReader(buf[:n]))
+			return &joinedReadCloser{
+				Reader:  bytes.NewReader(buf[:n]),
+				closers: []io.Closer{reader},
+			}
 		}
-		return io.NopCloser(bytes.NewReader(nil))
+		return &joinedReadCloser{
+			Reader:  bytes.NewReader(nil),
+			closers: []io.Closer{reader},
+		}
 	}
 
 	rd := io.MultiReader(bytes.NewReader(buf[:n]), reader)
@@ -353,29 +387,39 @@ func uncompressedReader(reader io.Reader) io.ReadCloser {
 	case bytes.Equal(buf[:3], []byte{0x1f, 0x8b, 0x8}):
 		r, err = gzip.NewReader(rd)
 	case bytes.Equal(buf[:3], []byte{0x42, 0x5A, 0x68}):
-		r = io.NopCloser(bzip2.NewReader(rd))
+		r = nopReadCloser{Reader: bzip2.NewReader(rd)}
 	case bytes.Equal(buf[:4], []byte{0x28, 0xb5, 0x2f, 0xfd}):
 		var zr *zstd.Decoder
 		zr, err = zstd.NewReader(rd)
-		r = io.NopCloser(zr)
+		r = nopReadCloser{Reader: zr}
 	case bytes.Equal(buf[:4], []byte{0x04, 0x22, 0x4d, 0x18}):
-		r = io.NopCloser(lz4.NewReader(rd))
+		r = nopReadCloser{Reader: lz4.NewReader(rd)}
 	case bytes.Equal(buf[:7], []byte{0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x0, 0x0}):
 		var zr *xz.Reader
 		zr, err = xz.NewReader(rd)
-		r = io.NopCloser(zr)
+		r = nopReadCloser{Reader: zr}
 	}
 
 	if err != nil || r == nil {
-		r = io.NopCloser(rd)
+		// Uncompressed data: keep the original ReadCloser
+		// (already prefixed with the consumed magic bytes).
+		return &joinedReadCloser{
+			Reader:  rd,
+			closers: []io.Closer{reader},
+		}
 	}
-	return r
+	// Compressed data: closing must reach both the decompressor
+	// and the underlying file.
+	return &joinedReadCloser{
+		Reader:  r,
+		closers: []io.Closer{r, reader},
+	}
 }
 
 // singleFileOpen opens one file. Also interpret stdin.
 func singleFileOpen(fileName string) (io.ReadCloser, error) {
 	if len(fileName) == 0 || fileName == "-" || strings.ToLower(fileName) == "stdin" {
-		return uncompressedReader(bufio.NewReader(os.Stdin)), nil
+		return uncompressedReader(nopReadCloser{Reader: bufio.NewReader(os.Stdin)}), nil
 	}
 	fileName = expandTilde(trimQuote(fileName))
 	file, err := os.Open(fileName)
@@ -387,7 +431,10 @@ func singleFileOpen(fileName string) (io.ReadCloser, error) {
 
 // globFileOpen expands the file path,
 // connects multiple files and returns one io.PipeReader.
-func globFileOpen(globName string) (*io.PipeReader, error) {
+// The goroutine stops early when ctx is canceled and closes
+// every file it opened, so a canceled wildcard import neither
+// blocks nor leaks descriptors.
+func globFileOpen(ctx context.Context, globName string) (*io.PipeReader, error) {
 	globName = expandTilde(trimQuote(globName))
 	fileNames, err := filepath.Glob(globName)
 	if err != nil {
@@ -404,7 +451,20 @@ func globFileOpen(globName string) (*io.PipeReader, error) {
 			}
 		}()
 		for _, fileName := range fileNames {
-			if err := copyFileOpen(pipeWriter, fileName); err != nil {
+			select {
+			case <-ctx.Done():
+				_ = pipeWriter.CloseWithError(ctx.Err())
+				return
+			default:
+			}
+			if err := copyFileOpen(ctx, pipeWriter, fileName); err != nil {
+				if errors.Is(err, context.Canceled) ||
+					errors.Is(err, context.DeadlineExceeded) ||
+					errors.Is(err, io.ErrClosedPipe) {
+					// Expected when the reader side gives up
+					// because the import was canceled.
+					return
+				}
 				log.Printf("ERROR: %s:%s", fileName, err)
 				continue
 			}
@@ -414,22 +474,45 @@ func globFileOpen(globName string) (*io.PipeReader, error) {
 }
 
 // copyFileOpen opens the file and copies it to the writer.
-func copyFileOpen(writer io.Writer, fileName string) error {
+// It returns early when ctx is canceled and always closes
+// the whole decompression chain (including the underlying file).
+func copyFileOpen(ctx context.Context, writer io.Writer, fileName string) error {
 	debug.Printf("Open: [%s]", fileName)
 	file, err := os.Open(fileName)
 	if err != nil {
 		return err
 	}
 	r := uncompressedReader(file)
+	defer func() {
+		if closeErr := r.Close(); closeErr != nil {
+			log.Printf("file close:%s", closeErr)
+		}
+	}()
 
-	if _, err := io.Copy(writer, r); err != nil {
-		return err
+	// Copy in chunks so a canceled context interrupts a blocked
+	// pipe write instead of leaving the goroutine stuck.
+	buf := make([]byte, 32*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		n, readErr := r.Read(buf)
+		if n > 0 {
+			if _, writeErr := writer.Write(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return readErr
+		}
 	}
 	// For if the file does not have a line break before EOF.
 	if _, err := writer.Write([]byte("\n")); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
 		return err
 	}
 	debug.Printf("Close: [%s]", fileName)

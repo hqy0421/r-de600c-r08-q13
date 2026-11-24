@@ -4,14 +4,17 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/dsnet/compress/bzip2"
 	"github.com/jwalton/gchalk"
@@ -23,6 +26,21 @@ import (
 
 // TableQuery is a query to use instead of TABLE.
 const TableQuery = "SELECT * FROM"
+
+// Exit codes returned by Cli.Run.
+const (
+	// ExitOK is returned when the query completed successfully.
+	ExitOK = 0
+	// ExitError is returned when the query failed.
+	ExitError = 1
+	// ExitUsage is returned for usage errors.
+	ExitUsage = 2
+	// ExitCanceled is returned when the query was canceled
+	// by a signal or an already-canceled context.
+	// It is deliberately distinct from ExitError so callers
+	// can tell cancellation apart from a failed execution.
+	ExitCanceled = 3
+)
 
 // Cli wraps stdout and stderr output destinations.
 type Cli struct {
@@ -59,7 +77,19 @@ func (v *nilString) Set(s string) error {
 
 // Run executes the main routine.
 // It returns the exit code.
+// SIGINT/SIGTERM cancel the running query; a canceled query
+// returns ExitCanceled, a failed query returns ExitError,
+// and a completed query returns ExitOK.
 func (cli Cli) Run(args []string) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return cli.RunContext(ctx, args)
+}
+
+// RunContext executes the main routine with the given context.
+// It is split from Run so the cancellation result can be
+// exercised without delivering an OS signal.
+func (cli Cli) RunContext(ctx context.Context, args []string) (code int) {
 	var (
 		usage     bool
 		version   bool
@@ -254,13 +284,21 @@ func (cli Cli) Run(args []string) int {
 		trdsql.InRowNumber(inRowNumber),
 	)
 
-	writer := cli.OutStream
+	// closers holds the output finalization chain in open order:
+	// the output file first, then any compression wrapper.
+	// They are closed in reverse order so the compressor
+	// flushes its trailer before the file handle is released.
+	var closers []io.Closer
+	writer := io.Writer(cli.OutStream)
 	if outFile != "" {
-		writer, err = os.Create(outFile)
+		var file *os.File
+		file, err = os.Create(outFile)
 		if err != nil {
 			log.Printf("%s", err)
-			return 1
+			return ExitError
 		}
+		writer = file
+		closers = append(closers, file)
 	}
 
 	outFormat := outputFormat(outFlag)
@@ -276,11 +314,26 @@ func (cli Cli) Run(args []string) int {
 		outCompression = outGuessCompression(outFile)
 	}
 
-	writer, err = compressionWriter(writer, outCompression)
+	compWriter, err := compressionWriter(writer, outCompression)
 	if err != nil {
 		log.Printf("%s", err)
-		return 1
+		closeAll(closers)
+		return ExitError
 	}
+	writer = compWriter
+	if wc, ok := writer.(io.Closer); ok && outCompression != "" {
+		closers = append(closers, wc)
+	}
+
+	// Finalize the result output even when the query is canceled,
+	// so the compressed stream and the output file are closed
+	// and any buffered trailer is flushed.
+	defer func() {
+		if closeErr := closeAll(closers); closeErr != nil && code == ExitOK {
+			log.Printf("%s", closeErr)
+			code = ExitError
+		}
+	}()
 
 	w := trdsql.NewWriter(
 		trdsql.OutFormat(outFormat),
@@ -306,21 +359,21 @@ func (cli Cli) Run(args []string) int {
 		trd.Dsn = dsn
 	}
 
-	ctx := context.Background()
-
 	if err = trd.ExecContext(ctx, query); err != nil {
-		log.Printf("%s", err)
-		return 1
-	}
-
-	if wc, ok := writer.(io.Closer); ok {
-		err = wc.Close()
-		if err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			log.Printf("canceled: %s", err)
+			return ExitCanceled
+		case errors.Is(err, context.DeadlineExceeded):
+			log.Printf("deadline exceeded: %s", err)
+			return ExitCanceled
+		default:
 			log.Printf("%s", err)
-			return 1
+			return ExitError
 		}
 	}
-	return 0
+
+	return ExitOK
 }
 
 // Usage outputs usage information.
@@ -643,4 +696,15 @@ func compressionWriter(w io.Writer, compression string) (io.Writer, error) {
 	default:
 		return w, nil
 	}
+}
+
+// closeAll closes the given closers in reverse order,
+// joining any errors. Reversing the order finalizes the
+// outer compression wrapper before the underlying file.
+func closeAll(closers []io.Closer) error {
+	var err error
+	for i := len(closers) - 1; i >= 0; i-- {
+		err = errors.Join(err, closers[i].Close())
+	}
+	return err
 }

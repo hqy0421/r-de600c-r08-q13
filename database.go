@@ -162,6 +162,11 @@ func (db *DB) copyImport(ctx context.Context, table *importTable, reader Reader)
 	}
 
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		table.row, err = reader.ReadRow(table.row)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
